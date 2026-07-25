@@ -132,4 +132,10 @@ macro_rules! thread_mod {
             $crate::thread_init_pthread!();
         }
     };
+    (kthread) => {
+        mod thread {
+            $crate::thread_statics!();
+            $crate::thread_init_kthread!();
+        }
+    };
 }

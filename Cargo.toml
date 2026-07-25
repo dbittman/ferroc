@@ -33,6 +33,7 @@ errno = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
 log = { version = "0.4", optional = true }
 memmap2 = { version = "0.9", optional = true }
+twizzler-abi = { path = "../../lib/twizzler-abi", default-features = false }
 
 [dev-dependencies]
 ctor = "0.2"
