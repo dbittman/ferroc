@@ -25,6 +25,7 @@ finer-grained = []
 global = []
 libc = ["dep:libc"]
 track-valgrind = ["dep:crabgrind"]
+kernel = []
 
 [dependencies]
 array-macro = "2.1"

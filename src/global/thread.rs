@@ -34,7 +34,6 @@ macro_rules! thread_statics {
                 HEAP.set(heap);
                 Some(Pin::get_ref(heap))
             }
-
             f(Pin::get_ref(HEAP.get()), fallback)
         }
     };
