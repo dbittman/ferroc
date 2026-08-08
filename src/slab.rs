@@ -585,6 +585,11 @@ impl<'a> Shard<'a> {
     }
 }
 
+/// Counts `set_delayed_tag` CASes that overwrote an `OCCUPIED` tag, i.e. stole
+/// an in-flight `push_block_mt` transaction. Must stay zero.
+#[cfg(test)]
+pub(crate) static STOLEN_OCCUPIED: AtomicUsize = AtomicUsize::new(0);
+
 // Indicates to push the freed block to the heapwise delayed free list.
 const VACANT: u8 = 0;
 // Indicates that the thread free list is currently in use.
@@ -677,6 +682,8 @@ impl<'a> Shard<'a> {
         let mut trial = 0;
         loop {
             let (cur_ptr, cur_tag) = Self::decompose_mt(cur);
+            #[cfg(test)]
+            let was_occupied = cur_tag == OCCUPIED;
             match cur_tag {
                 _ if cur_tag == tag => break true,
                 OCCUPIED => {
@@ -685,13 +692,23 @@ impl<'a> Shard<'a> {
                     }
                     trial += 1;
                     hint::spin_loop();
+                    // Wait for the in-flight `push_block_mt` to finish; CASing over OCCUPIED
+                    // would steal its transaction and it would find the tag it did not leave.
+                    cur = thread_free.load(Relaxed);
+                    continue;
                 }
                 NEVER => break false,
                 _ => debug_assert!(matches!(cur_tag, VACANT | SATURATED)),
             }
             let new = Self::compose_mt(cur_ptr, tag);
             match thread_free.compare_exchange_weak(cur, new, Release, Relaxed) {
-                Ok(_) => break true,
+                Ok(_) => {
+                    #[cfg(test)]
+                    if was_occupied {
+                        STOLEN_OCCUPIED.fetch_add(1, Relaxed);
+                    }
+                    break true;
+                }
                 Err(c) => cur = c,
             }
         }
@@ -941,3 +958,66 @@ impl<'a> Shard<'a> {
 }
 
 pub(crate) type ShardList<'a> = CellList<'a, Shard<'a>>;
+
+#[cfg(all(test, feature = "default"))]
+mod tests {
+    use core::{alloc::Layout, ptr::NonNull, sync::atomic::Ordering::Relaxed};
+    use std::{sync::mpsc, thread, vec::Vec};
+
+    use super::STOLEN_OCCUPIED;
+    use crate::Ferroc;
+
+    struct Ptr(NonNull<()>);
+    // SAFETY: the block is owned by whoever holds this, and is freed exactly once.
+    unsafe impl Send for Ptr {}
+
+    const LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(64, 8) };
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 200_000;
+
+    /// `push_block_mt` claims a shard's `thread_free` tag with VACANT ->
+    /// OCCUPIED, pushes onto the owner heap's `delayed_free`, then releases it
+    /// with OCCUPIED -> SATURATED. `set_delayed_tag` must wait that transaction
+    /// out rather than CAS over it: `Shard::fini` relies on the wait to know no
+    /// pusher is still about to dereference `delayed_free`.
+    ///
+    /// Each thread allocates from its own heap and hands every block to the
+    /// *next* thread to free, so every free takes the cross-thread path, while
+    /// the allocations keep each heap draining `delayed_free` (`reset_delayed`)
+    /// -- the other side of the race.
+    #[test]
+    fn set_delayed_tag_waits_out_in_flight_push() {
+        thread::scope(|s| {
+            let (txs, rxs): (Vec<_>, Vec<_>) =
+                (0..THREADS).map(|_| mpsc::channel::<Ptr>()).unzip();
+
+            for rx in rxs {
+                s.spawn(move || {
+                    for p in rx {
+                        // SAFETY: allocated with `LAYOUT` by a producer, freed once.
+                        unsafe { Ferroc.deallocate(p.0.cast(), LAYOUT) };
+                    }
+                });
+            }
+            for i in 0..THREADS {
+                let tx = txs[(i + 1) % THREADS].clone();
+                s.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        let p = Ferroc.allocate(LAYOUT).unwrap();
+                        if tx.send(Ptr(p)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            // Let the freers see their channels close once the producers finish.
+            drop(txs);
+        });
+
+        assert_eq!(
+            STOLEN_OCCUPIED.load(Relaxed),
+            0,
+            "set_delayed_tag CAS'd over OCCUPIED, stealing an in-flight push_block_mt"
+        );
+    }
+}
