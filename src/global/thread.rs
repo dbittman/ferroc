@@ -54,10 +54,24 @@ macro_rules! thread_init_pthread {
             /// - `id` must be a valid thread-local heap ID;
             /// - the thread-local heap must not be used after calling this function.
             unsafe extern "C" fn fini(id: *mut core::ffi::c_void) {
-                HEAP.set(core::pin::Pin::static_ref(&THREAD_LOCALS).empty_heap());
-                let id = id.addr().try_into().unwrap();
+                let id: u64 = id.addr().try_into().unwrap();
+                let tl = Pin::static_ref(&THREAD_LOCALS);
+                // Recycling the id is a pure function of the argument and is correct from any
+                // thread. Clearing `HEAP` is not: it is a `#[thread_local]` of whoever *runs* this
+                // destructor, so a reaper running it on behalf of a dead thread would abandon its
+                // own heap without recycling that id -- and, having emptied its slot, would take
+                // the id it just freed on its next allocation, leaving the next real thread to
+                // assign a fresh entry anyway. Guarded, the destructor is safe to run from a
+                // thread-teardown path, which is the only way it runs at all on a platform whose
+                // threads do not exit through `pthread_exit`.
+                //
+                // SAFETY: `id` is valid, so `get` may be called on it.
+                let owned = Pin::get_ref(unsafe { tl.get(id) }) as *const _ as *const ();
+                if Pin::get_ref(HEAP.get()) as *const _ as *const () == owned {
+                    HEAP.set(tl.empty_heap());
+                }
                 // SAFETY: `id` is valid; the thread-local heap is no longer used.
-                unsafe { Pin::static_ref(&THREAD_LOCALS).put(id) };
+                unsafe { tl.put(id) };
             }
 
             let data = ptr::without_provenance_mut(id.try_into().unwrap());
