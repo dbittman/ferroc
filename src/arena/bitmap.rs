@@ -188,6 +188,16 @@ impl Bitmap {
         range: Range<u32>,
         mut f: impl FnMut(&AtomicUsize, Range<u32>) -> (bool, bool),
     ) -> (bool, bool) {
+        // `ranges` derives a storage index from `range.start` before looking at whether the range
+        // is empty, so an empty range that starts exactly at the end of the bitmap indexes one
+        // past the last word. `Arena::from_dynamic` produces exactly that with
+        // `set::<true>(slab_count..bitmap.len())` when `slab_count == bitmap.len()`, i.e. whenever
+        // the slab count is a multiple of `BITS` (64) -- 32-slab arenas never hit it, 128-slab
+        // arenas panic on the first one. The `last` arm below already treats an empty tail as
+        // `Default::default()`; treat a wholly empty range the same way.
+        if range.is_empty() {
+            return Default::default();
+        }
         match Self::ranges(range) {
             Ranges::Infield(sto, range) => f(&self.0[sto], range),
             Ranges::Across {
@@ -213,6 +223,17 @@ impl Bitmap {
     #[inline]
     pub fn set<const VALUE: bool>(&self, range: Range<u32>) -> (bool, bool) {
         self.walk_storage(range, StorageExt::set::<VALUE>)
+    }
+
+    /// Clears the bits in `range`, returning how many were previously set.
+    pub fn clear_count(&self, range: Range<u32>) -> u32 {
+        let mut count = 0;
+        self.walk_storage(range, |sto, r| {
+            let mask = mask(r);
+            count += (sto.fetch_and(!mask, AcqRel) & mask).count_ones();
+            Default::default()
+        });
+        count
     }
 }
 

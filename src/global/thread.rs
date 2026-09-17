@@ -29,9 +29,14 @@ macro_rules! thread_statics {
         {
             fn fallback<'a>() -> Option<&'a Heap<'static, 'static>> {
                 let (heap, id) = Pin::static_ref(&THREAD_LOCALS).assign()?;
+                // Publish the assigned heap BEFORE `init`: `init` registers the thread destructor
+                // (e.g. `pthread_setspecific`), which can allocate, which re-enters `with_lazy`.
+                // With `HEAP` already set that reentrant allocation uses this heap instead of
+                // calling `fallback` again -- otherwise it re-`assign`s and re-`init`s without
+                // bound, overflowing the stack.
+                HEAP.set(heap);
                 // SAFETY: `init` is called only once for every thread-local heap.
                 unsafe { init(id) };
-                HEAP.set(heap);
                 Some(Pin::get_ref(heap))
             }
             f(Pin::get_ref(HEAP.get()), fallback)

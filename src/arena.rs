@@ -9,6 +9,7 @@ use core::{
     cell::UnsafeCell,
     mem::{self, ManuallyDrop, MaybeUninit},
     num::NonZeroUsize,
+    ops::Range,
     panic,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*},
@@ -17,7 +18,7 @@ use core::{
 use self::bitmap::Bitmap;
 use crate::{
     base::{BaseAlloc, Chunk},
-    config::{SLAB_SHIFT, SLAB_SIZE},
+    config::{DIRTY_SLAB_CAP, SLAB_SHIFT, SLAB_SIZE},
     heap::ObjSizeType,
     slab::{Slab, SlabRef, SlabSource},
 };
@@ -38,6 +39,7 @@ struct Arena<B: BaseAlloc> {
     is_exclusive: bool,
     slab_count: usize,
     search_index: AtomicUsize,
+    dirty_count: AtomicUsize,
 }
 
 impl<B: BaseAlloc> Arena<B> {
@@ -48,7 +50,8 @@ impl<B: BaseAlloc> Arena<B> {
             let bitmap_size = slab_count
                 .div_ceil(BYTE_WIDTH)
                 .next_multiple_of(mem::size_of::<AtomicUsize>());
-            let n = bitmap_size / mem::size_of::<AtomicUsize>();
+            // Two parallel bitmaps: allocation state, then dirty state.
+            let n = 2 * (bitmap_size / mem::size_of::<AtomicUsize>());
 
             let bitmap_layout = Layout::array::<AtomicUsize>(n).unwrap();
             let (header_layout, offset) = Self::LAYOUT.extend(bitmap_layout).unwrap();
@@ -79,13 +82,16 @@ impl<B: BaseAlloc> Arena<B> {
                 is_exclusive,
                 slab_count,
                 search_index: Default::default(),
+                dirty_count: Default::default(),
             })
         };
 
         if !is_exclusive {
-            // SAFETY: the bitmap pointer points to a valid & uninit memory block.
+            // SAFETY: the bitmap pointers point to valid & uninit memory blocks.
             unsafe {
                 let maybe = arena.bitmap_ptr().as_uninit_slice_mut();
+                maybe.fill(MaybeUninit::new(0));
+                let maybe = arena.dirty_bitmap_ptr().as_uninit_slice_mut();
                 maybe.fill(MaybeUninit::new(0));
             }
             let bitmap = arena.bitmap();
@@ -136,21 +142,55 @@ impl<B: BaseAlloc> Arena<B> {
         drop(unsafe { arena.read() });
     }
 
+    fn bitmap_size(&self) -> usize {
+        self.slab_count
+            .div_ceil(BYTE_WIDTH)
+            .next_multiple_of(mem::size_of::<AtomicUsize>())
+    }
+
     fn bitmap_ptr(&self) -> NonNull<[u8]> {
         let (ptr, _) = self.header.pointer().to_raw_parts();
         NonNull::from_raw_parts(
             ptr.map_addr(|addr| addr.checked_add(Self::LAYOUT.size()).unwrap()),
-            self.slab_count
-                .div_ceil(BYTE_WIDTH)
-                .next_multiple_of(mem::size_of::<AtomicUsize>()),
+            self.bitmap_size(),
         )
     }
 
-    fn bitmap(&self) -> &Bitmap {
-        let (ptr, len) = self.bitmap_ptr().to_raw_parts();
+    fn dirty_bitmap_ptr(&self) -> NonNull<[u8]> {
+        let size = self.bitmap_size();
+        let (ptr, _) = self.header.pointer().to_raw_parts();
+        NonNull::from_raw_parts(
+            ptr.map_addr(|addr| addr.checked_add(Self::LAYOUT.size() + size).unwrap()),
+            size,
+        )
+    }
+
+    fn bitmap_from(&self, ptr: NonNull<[u8]>) -> &Bitmap {
+        let (ptr, len) = ptr.to_raw_parts();
         let slice = NonNull::from_raw_parts(ptr, len / mem::size_of::<AtomicUsize>());
         // SAFETY: The bitmap pointer points to a valid `[AtomicUsize]`.
         Bitmap::new(unsafe { slice.as_ref() })
+    }
+
+    fn bitmap(&self) -> &Bitmap {
+        self.bitmap_from(self.bitmap_ptr())
+    }
+
+    /// Tracks freed slabs whose decommit was skipped; their memory is stale.
+    fn dirty_bitmap(&self) -> &Bitmap {
+        self.bitmap_from(self.dirty_bitmap_ptr())
+    }
+
+    /// # Safety
+    ///
+    /// `raw` must be within this arena's chunk.
+    unsafe fn slab_range(&self, raw: NonNull<[u8]>) -> Range<u32> {
+        let (ptr, len) = raw.to_raw_parts();
+        let offset = unsafe {
+            ptr.cast::<u8>()
+                .offset_from_unsigned(self.chunk.pointer().cast())
+        };
+        (offset / SLAB_SIZE) as u32..((offset + len) / SLAB_SIZE) as u32
     }
 
     fn allocate_slices(&self, count: usize) -> Option<NonNull<[u8]>> {
@@ -190,13 +230,22 @@ impl<B: BaseAlloc> Arena<B> {
         {
             return Some(Err(Error::Commit(err)));
         }
+        // A dirty slab skipped its decommit in `deallocate`, so its free
+        // memory is stale and must not claim the base's zero guarantee.
+        // SAFETY: `ptr` was just allocated from this arena's chunk.
+        let dirty = self
+            .dirty_bitmap()
+            .clear_count(unsafe { self.slab_range(ptr) });
+        if dirty > 0 {
+            self.dirty_count.fetch_sub(dirty as usize, Relaxed);
+        }
         // SAFETY: The fresh allocation is aligned to `SLAB_SIZE`.
         Some(Ok(unsafe {
             Slab::init(
                 ptr,
                 thread_id,
                 SlabSource::Arena(self.arena_id),
-                B::IS_ZEROED,
+                B::IS_ZEROED && dirty == 0,
             )
         }))
     }
@@ -208,20 +257,31 @@ impl<B: BaseAlloc> Arena<B> {
     ///   this function.
     unsafe fn deallocate(&self, slab: SlabRef<'_, B>, base: &B) -> usize {
         let raw = slab.into_raw();
-        unsafe { base.decommit(raw) };
-        let (ptr, len) = raw.to_raw_parts();
-        let offset = unsafe {
-            ptr.cast::<u8>()
-                .offset_from_unsigned(self.chunk.pointer().cast())
-        };
-
-        let (start, end) = (offset / SLAB_SIZE, (offset + len) / SLAB_SIZE);
-        self.bitmap().set::<false>((start as u32)..(end as u32));
-        end - start
+        // SAFETY: `raw` was allocated from this arena's chunk.
+        let range = unsafe { self.slab_range(raw) };
+        let count = (range.end - range.start) as usize;
+        // Keep up to `DIRTY_SLAB_CAP` freed slabs committed per arena, marked
+        // dirty instead of decommitted: a promptly reused slab would only be
+        // re-faulted and re-zeroed. Dirty bits are set before the allocation
+        // bits are cleared, since clearing those publishes the slabs to
+        // `allocate_slices`.
+        let cache = self
+            .dirty_count
+            .fetch_update(Relaxed, Relaxed, |n| {
+                (n + count <= DIRTY_SLAB_CAP).then_some(n + count)
+            })
+            .is_ok();
+        if cache {
+            self.dirty_bitmap().set::<true>(range.clone());
+        } else {
+            unsafe { base.decommit(raw) };
+        }
+        self.bitmap().set::<false>(range);
+        count
     }
 }
 
-const MAX_ARENAS: usize = 112;
+const MAX_ARENAS: usize = 256;
 /// A collection of arenas.
 ///
 /// This structure manages all the memory within its lifetime. Multiple

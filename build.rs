@@ -22,8 +22,13 @@ fn generate_configs() {
             comment: "The minimal allocation unit of slabs, in bits.",
         }),
         ("SLAB_SHIFT", ConfigValue {
-            value: 2 + 10 + 10,
+            value: 2 + 10 + 8,
             comment: "The minimal allocation unit of arenas, in bits.",
+        }),
+        ("DIRTY_SLAB_CAP", ConfigValue {
+            value: 8,
+            comment: "Max freed slabs kept committed (dirty) per arena awaiting reuse; \
+                0 decommits every freed slab immediately.",
         }),
     ];
 

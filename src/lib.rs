@@ -192,6 +192,12 @@ pub mod config {
     const _: () = assert!(SHARD_COUNT > 1, "A slab must have at least two shards");
 }
 
+/// Diagnostic counters, read by the host runtime to explain arena growth. Additive and
+/// unconditional (a relaxed increment on cold paths only -- arena/slab/thread-heap creation, never
+/// per allocation).
+///
+/// `[arenas_created, slabs_from_arena, slabs_to_arena, thread_heaps, arena_new_for_count,
+///   reclaimed_slabs, dirty_reused, _spare]`
 #[cfg(feature = "default")]
 config_mod!(global_mmap: pub crate::base::Mmap: pthread);
 

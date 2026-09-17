@@ -184,6 +184,9 @@ impl<'a, B: BaseAlloc> Slab<'a, B> {
             (&raw mut (*slab).size).write(ptr.len());
             (&raw mut (*slab).used).write(Cell::new(0));
             (&raw mut (*slab).abandoned).write(Cell::new(0));
+            // The memory may be recycled without decommit (dirty), so don't
+            // rely on it reading zero.
+            (&raw mut (*slab).abandoned_next).write(AtomicPtr::new(ptr::null_mut()));
 
             let shards: &mut [MaybeUninit<Shard<'a>>; SHARD_COUNT] =
                 mem::transmute((&raw mut (*slab).shards).as_uninit_mut().unwrap_unchecked());
