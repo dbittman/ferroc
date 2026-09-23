@@ -97,7 +97,8 @@ impl Bitmap {
             let (end, end_bit) = ((end_idx / BITS) as usize, end_idx % BITS);
 
             let mid_sto = &self.0[(start + 1)..end];
-            let end_sto = (end_bit != 0).then_some(&self.0[end]);
+            // `then`, not `then_some`: a run ending on the last word boundary has `end == len`.
+            let end_sto = (end_bit != 0).then(|| &self.0[end]);
 
             // Check all the following bits.
             if mid_sto.iter().any(|sto| sto.load(Relaxed) != 0)
@@ -148,8 +149,9 @@ impl Bitmap {
                 return Some(start_bit);
             };
 
-            // Roll back possibly done middle bits.
-            let mid_done = self.0[(start + 1)..err_pos].iter().rev();
+            // Roll back possibly done middle bits. A lost start CAS leaves `err_pos == start`,
+            // and `(start + 1)..start` is an inverted range that panics.
+            let mid_done = self.0[(start + 1)..err_pos.max(start + 1)].iter().rev();
             mid_done.for_each(|sto| sto.store(0, Release));
 
             // Roll back possibly done start bits.
@@ -175,10 +177,12 @@ impl Bitmap {
         }
 
         let can_allocate_infield = count <= BITS;
+        // `idx`, not `start`: the bit comes back relative to the word searched, and pairing a
+        // retry's hit in the first word with a later `idx` returned slabs the bitmap never reserved.
         self.loop_at(start).find_map(|(idx, sto)| {
             can_allocate_infield
                 .then(|| sto.allocate(count))
-                .or_else(|| Some(self.allocate_across_in(start, count)))
+                .or_else(|| Some(self.allocate_across_in(idx, count)))
                 .and_then(|bit| Some((idx, bit?)))
         })
     }

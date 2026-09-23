@@ -198,7 +198,9 @@ impl<B: BaseAlloc> Arena<B> {
         let (idx, bit) = self.bitmap().allocate(start, count.try_into().ok()?)?;
         self.search_index.store(idx, Relaxed);
 
-        let offset = (idx * BYTE_WIDTH + (bit as usize)) * SLAB_SIZE;
+        // `idx` indexes usize words; `BYTE_WIDTH` sizes the bitmap in bytes. Mixing them placed
+        // every slab from the second word 56 slabs too low, on top of live ones.
+        let offset = (idx * usize::BITS as usize + (bit as usize)) * SLAB_SIZE;
         // SAFETY: `idx` and `bit` is valid, and thus `offset` is within the chunk
         // memory range.
         let data = unsafe { self.chunk.pointer().byte_add(offset) };

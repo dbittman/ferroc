@@ -705,13 +705,13 @@ impl<'arena: 'cx, 'cx, B: BaseAlloc> Heap<'arena, 'cx, B> {
                 tested_layout.size() >= layout.size(),
                 "the layout validation of allocation at {ptr:p} failed:\n\
                 \trequest: {layout:?}\n\
-                \tcalculated: {layout:?}"
+                \tcalculated: {tested_layout:?}"
             );
             assert!(
                 tested_layout.align() >= layout.align(),
                 "the layout validation of allocation at {ptr:p} failed:\n\
                 \trequest: {layout:?}\n\
-                \tcalculated: {layout:?}"
+                \tcalculated: {tested_layout:?}"
             );
         }
         // SAFETY: `ptr` is allocated by these structures.
